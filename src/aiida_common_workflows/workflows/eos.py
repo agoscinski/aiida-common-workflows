@@ -1,13 +1,18 @@
 """Equation of state workflow that can use any code plugin implementing the common relax workflow."""
 import inspect
+from collections.abc import Mapping, Sequence
+from importlib import import_module
 
 from aiida import orm
 from aiida.common import exceptions
-from aiida.engine import WorkChain, append_, calcfunction
+from aiida.engine import GraphHandle, PreparedRun, ToContext, WorkChain
 from aiida.plugins import WorkflowFactory
 
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, RelaxType, SpinType
 from aiida_common_workflows.workflows.relax.workchain import CommonRelaxWorkChain
+
+from ._geometry import scale_structure as scale_structure  # noqa: PLC0414
+from ._scan import point_results, submit_scan
 
 
 def validate_inputs(value, _):
@@ -64,12 +69,42 @@ def validate_relax_type(value, _):
         return '`generator_inputs.relax_type`. Equation of state and relaxation with variable volume not compatible.'
 
 
-@calcfunction
-def scale_structure(structure: orm.StructureData, scale_factor: orm.Float) -> orm.StructureData:
-    """Scale the structure with the given scaling factor."""
-    ase = structure.get_ase().copy()
-    ase.set_cell(ase.get_cell() * float(scale_factor) ** (1 / 3), scale_atoms=True)
-    return orm.StructureData(ase=ase)
+_QE_BACKEND = 'common_workflows.relax.quantum_espresso'
+
+
+def prepare_eos(  # noqa: PLR0913
+    *,
+    backend: str,
+    structure: orm.StructureData,
+    scale_factors: Sequence[float],
+    protocol: str,
+    generator_inputs: Mapping,
+    overrides: Mapping | None = None,
+) -> tuple[GraphHandle, PreparedRun]:
+    """Select an EOS graph and resolve its inputs before launch.
+
+    ``backend`` is a common relaxation entry point name. Only Quantum ESPRESSO
+    currently provides a prepared EOS graph; other backends use the legacy API.
+
+    :param backend: Common relaxation entry point.
+    :param structure: Unscaled reference structure.
+    :param scale_factors: Ordered volume factors; the first selects the reference.
+    :param protocol: Backend protocol name.
+    :param generator_inputs: Inputs to the backend protocol resolver, such as engines and relaxation type.
+    :param overrides: Optional concrete relaxation port overrides.
+    :return: Concrete graph and its prepared launch settings.
+    :raises ValueError: If the backend or EOS inputs are unsupported.
+    """
+    if backend != _QE_BACKEND:
+        msg = f'No prepared EOS graph is available for {backend!r}.'
+        raise ValueError(msg)
+    if error := validate_relax_type(generator_inputs.get('relax_type'), None):
+        raise ValueError(error)
+    module = import_module('aiida_common_workflows.workflows.relax.quantum_espresso.eos')
+    return module.qe_eos, module.prepare(
+        structure=structure, scale_factors=scale_factors, protocol=protocol,
+        generator_inputs=generator_inputs, overrides=overrides,
+    )
 
 
 class EquationOfStateWorkChain(WorkChain):
@@ -113,9 +148,7 @@ class EquationOfStateWorkChain(WorkChain):
         spec.input('sub_process_class', non_db=True, validator=validate_sub_process_class)
         spec.inputs.validator = validate_inputs
         spec.outline(
-            cls.run_init,
-            cls.inspect_init,
-            cls.run_eos,
+            cls.run_scan,
             cls.inspect_eos,
         )
         spec.output_namespace('structures', valid_type=orm.StructureData,
@@ -136,70 +169,33 @@ class EquationOfStateWorkChain(WorkChain):
         increment = self.inputs.scale_increment.value
         return tuple(float(1 + i * increment - (count - 1) * increment / 2) for i in range(count))
 
-    def get_sub_workchain_builder(self, scale_factor, reference_workchain=None):
-        """Return the builder for the relax workchain."""
-        structure = scale_structure(self.inputs.structure, scale_factor)
-        process_class = WorkflowFactory(self.inputs.sub_process_class)
-
-        base_inputs = {'structure': structure}
-        if reference_workchain is not None:
-            base_inputs['reference_workchain'] = reference_workchain
-
-        builder = process_class.get_input_generator().get_builder(**base_inputs, **self.inputs.generator_inputs)
-        builder._merge(**self.inputs.get('sub_process', {}))
-
-        return builder, structure
-
-    def run_init(self):
-        """
-        Run the first workchain.
-
-        This is run for the first (usually the smallest) volume in the set of scale factors,
-        which is then used as a reference workchain for all other calculations.
-        Each plugin should then reuse the relevant parameters from this reference
-        calculation, in particular the choice of the k-points grid.
-        """
-        scale_factor = orm.Float(self.get_scale_factors()[0])
-        builder, structure = self.get_sub_workchain_builder(scale_factor)
-        self.report(f'submitting `{builder.process_class.__name__}` for scale_factor `{scale_factor}`')
-        self.ctx.reference_workchain = self.submit(builder)
-        self.ctx.structures = [structure]
-        self.to_context(children=append_(self.ctx.reference_workchain))
-
-    def inspect_init(self):
-        """Check that the first workchain finished successfully or abort the workchain."""
-        if not self.ctx.children[0].is_finished_ok:
-            self.report('Initial sub process did not finish successful so aborting the workchain.')
-            return self.exit_codes.ERROR_SUB_PROCESS_FAILED.format(cls=self.inputs.sub_process_class)
-
-    def run_eos(self):
-        """Run the sub process at each scale factor to compute the structure volume and total energy."""
-        for scale_factor in self.get_scale_factors()[1:]:
-            reference_workchain = self.ctx.reference_workchain
-            builder, structure = self.get_sub_workchain_builder(
-                orm.Float(scale_factor), reference_workchain=reference_workchain
+    def run_scan(self):
+        """Submit the prepared QE EOS graph or fall back to legacy backends."""
+        if self.inputs.sub_process_class == _QE_BACKEND and 'structure' not in self.inputs.get('sub_process', {}):
+            generator_inputs = dict(self.inputs.generator_inputs)
+            protocol = generator_inputs.pop('protocol')
+            workflow, prepared = prepare_eos(
+                backend=_QE_BACKEND,
+                structure=self.inputs.structure,
+                scale_factors=self.get_scale_factors(),
+                protocol=protocol,
+                generator_inputs=generator_inputs,
+                overrides=self.inputs.get('sub_process'),
             )
-            self.report(f'submitting `{builder.process_class.__name__}` for scale_factor `{scale_factor}`')
-            self.ctx.structures.append(structure)
-            self.to_context(children=append_(self.submit(builder)))
+            return ToContext(scan=self.submit(workflow, prepared_run=prepared))
+        return submit_scan(
+            self, structure=self.inputs.structure, coordinates=self.get_scale_factors(), mode='volume', reference=True
+        )
 
     def inspect_eos(self):
-        """Inspect all children workflows to make sure they finished successfully."""
-        if any(not child.is_finished_ok for child in self.ctx.children):
+        """Publish structures, energies and available magnetizations in scale order."""
+        if not self.ctx.scan.is_finished_ok:
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED.format(cls=self.inputs.sub_process_class)
 
-        for index, child in enumerate(self.ctx.children):
-            try:
-                structure = child.outputs.relaxed_structure
-            except exceptions.NotExistent:
-                structure = self.ctx.structures[index]
-
-            volume = structure.get_cell_volume()
-            energy = child.outputs.total_energy
-
-            self.report(f'Image {index}: volume={volume}, total energy={energy.value}')
+        for index, (outputs, _, structure) in enumerate(point_results(self.ctx.scan)):
+            energy = outputs['total_energy']
+            self.report(f'Image {index}: volume={structure.get_cell_volume()}, total energy={energy.value}')
             self.out(f'structures.{index}', structure)
             self.out(f'total_energies.{index}', energy)
-
-            if 'total_magnetization' in child.outputs:
-                self.out(f'total_magnetizations.{index}', child.outputs.total_magnetization)
+            if 'total_magnetization' in outputs:
+                self.out(f'total_magnetizations.{index}', outputs['total_magnetization'])

@@ -17,7 +17,7 @@ classifiers = [
   'Programming Language :: Python :: 3.12'
 ]
 dependencies = [
-  'aiida-core[atomic_tools]~=2.1',
+  'aiida-core[atomic_tools]>=3.0.0.dev0,<4',
   'ase!=3.20.*',
   'click~=8.0',
   'pint~=0.16',
