@@ -5,7 +5,7 @@ from aiida.engine import calcfunction
 from aiida.plugins import WorkflowFactory
 
 from ..workchain import CommonRelaxWorkChain
-from .generator import QuantumEspressoCommonRelaxInputGenerator
+from .generator import QuantumEspressoCommonRelaxInputGenerator, get_kpoints_used
 
 __all__ = ('QuantumEspressoCommonRelaxWorkChain',)
 
@@ -48,6 +48,12 @@ class QuantumEspressoCommonRelaxWorkChain(CommonRelaxWorkChain):
     _process_class = WorkflowFactory('quantumespresso.pw.relax')
     _generator_class = QuantumEspressoCommonRelaxInputGenerator
 
+    @classmethod
+    def define(cls, spec):
+        super().define(spec)
+        spec.output('kpoints_used', valid_type=orm.KpointsData, required=False,
+                    help='The original k-point mesh used by the final Quantum ESPRESSO calculation.')
+
     def convert_outputs(self):
         """Convert the outputs of the sub workchain to the common output specification."""
         outputs = self.ctx.workchain.outputs
@@ -63,6 +69,7 @@ class QuantumEspressoCommonRelaxWorkChain(CommonRelaxWorkChain):
         self.out('total_energy', total_energy)
         self.out('forces', forces)
         self.out('stress', stress)
+        self.out('kpoints_used', get_kpoints_used(self.ctx.workchain))
 
         for output_name in OPTIONAL_OUTPUT_PORTS:
             if output_name in results:

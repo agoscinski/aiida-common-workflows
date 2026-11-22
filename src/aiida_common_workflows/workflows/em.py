@@ -4,11 +4,13 @@ import inspect
 
 from aiida import orm
 from aiida.common import exceptions
-from aiida.engine import WorkChain, append_
+from aiida.engine import WorkChain
 from aiida.plugins import WorkflowFactory
 
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, OptionalRelaxFeatures, RelaxType, SpinType
 from aiida_common_workflows.workflows.relax.workchain import CommonRelaxWorkChain
+
+from ._scan import point_results, submit_scan
 
 
 def validate_inputs(value, _):
@@ -90,7 +92,7 @@ class EnergyMagnetizationWorkChain(WorkChain):
         spec.inputs.validator = validate_inputs
 
         spec.outline(
-            cls.run_em,
+            cls.run_scan,
             cls.inspect_em,
         )
 
@@ -115,42 +117,23 @@ class EnergyMagnetizationWorkChain(WorkChain):
         spec.exit_code(400, 'ERROR_SUB_PROCESS_FAILED',
             message='At least one of the `{cls}` sub processes did not finish successfully.')
 
-    def get_sub_workchain_builder(self, total_magnetization):
-        """Return the builder for the relax workchain."""
-        structure = self.inputs.structure
-        process_class = WorkflowFactory(self.inputs.sub_process_class)
-
-        base_inputs = {'structure': structure, 'fixed_total_cell_magnetization': total_magnetization}
-
-        builder = process_class.get_input_generator().get_builder(**base_inputs, **self.inputs.generator_inputs)
-        builder._merge(**self.inputs.get('sub_process', {}))
-
-        return builder
-
-    def run_em(self):
-        """Run the sub process at each scale factor to compute the structure volume and total energy."""
-        for total_magnetization in self.inputs.fixed_total_magnetizations:
-            builder = self.get_sub_workchain_builder(total_magnetization)
-            self.report(
-                f'submitting `{builder.process_class.__name__}` for total_magnetization `{total_magnetization}`'
-            )
-            self.to_context(children=append_(self.submit(builder)))
+    def run_scan(self):
+        """Submit all magnetization points independently."""
+        return submit_scan(
+            self, structure=self.inputs.structure, coordinates=self.inputs.fixed_total_magnetizations,
+            mode='magnetization', reference=False,
+        )
 
     def inspect_em(self):
-        """Inspect all children workflows to make sure they finished successfully."""
-        if any(not child.is_finished_ok for child in self.ctx.children):
+        """Publish energies, magnetizations and spin-resolved Fermi energies in input order."""
+        if not self.ctx.scan.is_finished_ok:
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED.format(cls=self.inputs.sub_process_class)
 
-        for index, child in enumerate(self.ctx.children):
-            energy = child.outputs.total_energy
-            total_magnetization = child.outputs.total_magnetization
-
-            fermi_energy_up = child.outputs.fermi_energy_up
-            fermi_energy_down = child.outputs.fermi_energy_down
-
+        for index, (outputs, _, _) in enumerate(point_results(self.ctx.scan)):
+            energy = outputs['total_energy']
+            total_magnetization = outputs['total_magnetization']
             self.report(f'Image {index}: total_magnetization={total_magnetization}, total energy={energy.value}')
-
             self.out(f'total_energies.{index}', energy)
             self.out(f'total_magnetizations.{index}', total_magnetization)
-            self.out(f'fermi_energies_up.{index}', fermi_energy_up)
-            self.out(f'fermi_energies_down.{index}', fermi_energy_down)
+            self.out(f'fermi_energies_up.{index}', outputs['fermi_energy_up'])
+            self.out(f'fermi_energies_down.{index}', outputs['fermi_energy_down'])

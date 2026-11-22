@@ -1,5 +1,12 @@
 # Change log
 
+## Unreleased
+
+### Breaking changes
+
+- The equation-of-state, dissociation and magnetization scans require graph-enabled AiiDA Core 3.0. Their entry points and indexed output values are unchanged, but the output nodes are copies and relaxation processes are now descendants rather than direct children. Finish in-flight scans before upgrading and see [the graph rewrite report](GRAPH_REWRITE.md) for migration details.
+- Per-point builder construction moved from the scan classes’ `get_sub_workchain_builder` methods to the internal scan adapter. To build a relaxation independently, use the selected backend’s input generator.
+
 ## 1.0.1 - 2023-09-16
 
 ### Fixes

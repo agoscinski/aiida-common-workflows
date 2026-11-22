@@ -11,7 +11,7 @@ from aiida import engine
 from aiida.common import exceptions
 from aiida.common.constants import elements
 
-pytest_plugins = ['aiida.manage.tests.pytest_fixtures']
+pytest_plugins = ['aiida.tools.pytest_fixtures']
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -21,10 +21,9 @@ def with_database(aiida_profile):
 
 
 @pytest.fixture
-def with_clean_database(with_database):
-    """Fixture to clear the database before yielding to the test."""
-    with_database.clear_profile()
-    yield
+def with_clean_database(aiida_profile_clean):
+    """Compatibility alias for the fixture that clears the test profile."""
+    yield aiida_profile_clean
 
 
 @pytest.fixture

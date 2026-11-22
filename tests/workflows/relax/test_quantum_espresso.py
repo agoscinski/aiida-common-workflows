@@ -1,6 +1,8 @@
 """Tests for the :mod:`aiida_common_workflows.workflows.relax.quantum_espresso` module."""
 import pytest
-from aiida import engine, plugins
+from aiida import engine, orm, plugins
+from aiida.common import LinkType
+
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, RelaxType, SpinType
 
 
@@ -21,6 +23,41 @@ def default_builder_inputs(generate_code, generate_structure):
             }
         },
     }
+
+
+def test_reference_kpoints_are_used_by_all_active_qe_stages():
+    """Use the actual final mesh node instead of computing it from a distance."""
+    from aiida_common_workflows.workflows.relax.quantum_espresso.generator import (
+        QuantumEspressoCommonRelaxInputGenerator,
+        get_kpoints_used,
+    )
+
+    relax = orm.WorkChainNode().store()
+    base = orm.WorkChainNode()
+    base.base.links.add_incoming(relax, link_type=LinkType.CALL_WORK, link_label='last_base')
+    base.store()
+    mesh = orm.KpointsData()
+    mesh.set_kpoints_mesh([2, 4, 6])
+    mesh.store()
+    calc = orm.CalcJobNode()
+    calc.base.links.add_incoming(base, link_type=LinkType.CALL_CALC, link_label='last_pw')
+    calc.base.links.add_incoming(mesh, link_type=LinkType.INPUT_CALC, link_label='kpoints')
+    calc.store()
+
+    used = get_kpoints_used(relax)
+    assert used.pk == mesh.pk
+    builder = plugins.WorkflowFactory('common_workflows.relax.quantum_espresso').get_builder()
+    stages = ['base', 'base_final_scf'] if hasattr(builder, 'base') else ['base_relax', 'base_init_relax']
+    for name in stages:
+        builder[name].kpoints_distance = orm.Float(0.2)
+        builder[name].kpoints_force_parity = orm.Bool(True)
+
+    QuantumEspressoCommonRelaxInputGenerator.apply_reference_kpoints(builder, used)
+
+    for name in stages:
+        assert builder[name].kpoints.pk == mesh.pk
+        assert 'kpoints_distance' not in builder[name]
+        assert 'kpoints_force_parity' not in builder[name]
 
 
 @pytest.mark.usefixtures('sssp')

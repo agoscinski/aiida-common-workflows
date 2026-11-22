@@ -64,6 +64,13 @@ def create_magnetic_allotrope(structure, magnetization_per_site):
     return (allotrope, allotrope_magnetic_moments)
 
 
+def get_kpoints_used(relax: orm.WorkChainNode) -> orm.KpointsData:
+    """Return the mesh from the final calculation of the relaxation, as used by reference scans."""
+    base = max((node for node in relax.called if isinstance(node, orm.WorkChainNode)), key=lambda node: node.ctime)
+    calculation = max((node for node in base.called if isinstance(node, orm.CalcJobNode)), key=lambda node: node.ctime)
+    return calculation.inputs.kpoints
+
+
 class QuantumEspressoCommonRelaxInputGenerator(CommonRelaxInputGenerator):
     """Input generator for the common relax workflow implementation of Quantum ESPRESSO."""
 
@@ -105,6 +112,19 @@ class QuantumEspressoCommonRelaxInputGenerator(CommonRelaxInputGenerator):
         )
         spec.inputs['electronic_type'].valid_type = ChoiceType((ElectronicType.METAL, ElectronicType.INSULATOR))
         spec.inputs['engines']['relax']['code'].valid_type = CodeType('quantumespresso.pw')
+
+    @staticmethod
+    def apply_reference_kpoints(builder: engine.ProcessBuilder, kpoints: orm.KpointsData) -> None:
+        """Use the reference mesh instead of generating a new one from a density."""
+        for name in ('base', 'base_final_scf', 'base_relax', 'base_init_relax'):
+            if name not in builder:
+                continue
+            namespace = builder[name]
+            if not namespace:
+                continue
+            namespace.pop('kpoints_distance', None)
+            namespace.pop('kpoints_force_parity', None)
+            namespace['kpoints'] = kpoints
 
     def _construct_builder(self, **kwargs) -> engine.ProcessBuilder:  # noqa: PLR0912,PLR0915
         """Construct a process builder based on the provided keyword arguments.
@@ -226,18 +246,13 @@ class QuantumEspressoCommonRelaxInputGenerator(CommonRelaxInputGenerator):
             builder.base['pw']['parameters'] = orm.Dict(dict=parameters)
 
         if reference_workchain:
-            relax = reference_workchain.base.links.get_outgoing(node_class=orm.WorkChainNode).one().node
-            base = sorted(relax.called, key=lambda x: x.ctime)[-1]
-            calc = sorted(base.called, key=lambda x: x.ctime)[-1]
-            kpoints = calc.inputs.kpoints
-
-            builder.base.pop('kpoints_distance', None)
-            builder.base.pop('kpoints_force_parity', None)
-            builder.base_final_scf.pop('kpoints_distance', None)
-            builder.base_final_scf.pop('kpoints_force_parity', None)
-
-            builder.base['kpoints'] = kpoints
-            builder.base_final_scf['kpoints'] = kpoints
+            if 'kpoints_used' in reference_workchain.outputs:
+                kpoints = reference_workchain.outputs.kpoints_used
+            else:
+                # Existing reference runs predate the explicit output.
+                relax = reference_workchain.base.links.get_outgoing(node_class=orm.WorkChainNode).one().node
+                kpoints = get_kpoints_used(relax)
+            self.apply_reference_kpoints(builder, kpoints)
 
         # Currently the builder is set for the `PwRelaxWorkChain`, but we should return one for the wrapper workchain
         # `QuantumEspressoCommonRelaxWorkChain` for which this input generator is built

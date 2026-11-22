@@ -6,11 +6,14 @@ import inspect
 
 from aiida import orm
 from aiida.common import exceptions
-from aiida.engine import WorkChain, append_, calcfunction
+from aiida.engine import WorkChain
 from aiida.plugins import WorkflowFactory
 
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, RelaxType, SpinType
 from aiida_common_workflows.workflows.relax.workchain import CommonRelaxWorkChain
+
+from ._geometry import set_distance as set_distance  # noqa: PLC0414
+from ._scan import point_results, submit_scan
 
 
 def validate_inputs(value, _):
@@ -85,22 +88,6 @@ def validate_relax(value, _):
         return '`generator_inputs.relax_type`. Only `RelaxType.NONE` supported.'
 
 
-@calcfunction
-def set_distance(molecule: orm.StructureData, distance: orm.Float) -> orm.StructureData:
-    """
-    Move both sites of the molecule to symmetric points around the origin which are on the line connecting the original
-    sites and which are separated by the target distance.
-    """
-    import numpy as np
-
-    vector_diff = np.array(molecule.sites[1].position) - np.array(molecule.sites[0].position)
-    versor_diff = vector_diff / np.linalg.norm(vector_diff)
-    new_molecule = molecule.clone()
-    new_position = (distance.value * versor_diff) / 2
-    new_molecule.base.attributes.get('sites')[0]['position'] = -new_position
-    new_molecule.base.attributes.get('sites')[1]['position'] = new_position
-    return new_molecule
-
 
 class DissociationCurveWorkChain(WorkChain):
     """Workflow to compute the dissociation curve of for a given diatomic molecule."""
@@ -138,9 +125,7 @@ class DissociationCurveWorkChain(WorkChain):
         spec.input('sub_process_class', non_db=True, validator=validate_sub_process_class)
         spec.inputs.validator = validate_inputs
         spec.outline(
-            cls.run_init,
-            cls.inspect_init,
-            cls.run_dissociation,
+            cls.run_scan,
             cls.inspect_results,
         )
         spec.output_namespace('distances', valid_type=orm.Float,
@@ -162,59 +147,22 @@ class DissociationCurveWorkChain(WorkChain):
         minimum = self.inputs.distance_min.value
         return [orm.Float(minimum + i * (maximum - minimum) / (count - 1)) for i in range(count)]
 
-    def get_sub_workchain_builder(self, distance, reference_workchain=None):
-        """Return the builder for the relax workchain."""
-        molecule = set_distance(self.inputs.molecule, distance)
-        process_class = WorkflowFactory(self.inputs.sub_process_class)
-
-        builder = process_class.get_input_generator().get_builder(
-            structure=molecule, reference_workchain=reference_workchain, **self.inputs.generator_inputs
+    def run_scan(self):
+        """Submit the reference-first distance scan."""
+        return submit_scan(
+            self, structure=self.inputs.molecule, coordinates=[distance.value for distance in self.get_distances()],
+            mode='distance', reference=True,
         )
-        builder._merge(**self.inputs.get('sub_process', {}))
-
-        distance_node = molecule.creator.inputs.distance
-
-        return builder, distance_node
-
-    def run_init(self):
-        """Run the first workchain."""
-        distance = self.get_distances()[0]
-        builder, distance_node = self.get_sub_workchain_builder(distance)
-        self.ctx.distance_nodes = [distance_node]
-        self.report(f'submitting `{builder.process_class.__name__}` for distance `{distance.value}`')
-        self.ctx.reference_workchain = self.submit(builder)
-        self.to_context(children=append_(self.ctx.reference_workchain))
-
-    def inspect_init(self):
-        """Check that the first workchain finished successfully or abort the workchain."""
-        if not self.ctx.children[0].is_finished_ok:
-            self.report('Initial sub process did not finish successful so aborting the workchain.')
-            return self.exit_codes.ERROR_SUB_PROCESS_FAILED.format(cls=self.inputs.sub_process_class)
-
-    def run_dissociation(self):
-        """Run the sub process at each distance to compute the total energy."""
-        for distance in self.get_distances()[1:]:
-            reference_workchain = self.ctx.reference_workchain
-            builder, distance_node = self.get_sub_workchain_builder(distance, reference_workchain=reference_workchain)
-            self.ctx.distance_nodes.append(distance_node)
-            self.report(f'submitting `{builder.process_class.__name__}` for dinstance `{distance.value}`')
-            self.to_context(children=append_(self.submit(builder)))
 
     def inspect_results(self):
-        """
-        Inspect all children workflows to make sure they finished successfully.
-        Collect the total energies and return an array with the results.
-        """
-        if any(not child.is_finished_ok for child in self.ctx.children):
+        """Publish distances, energies and available magnetizations in input order."""
+        if not self.ctx.scan.is_finished_ok:
             return self.exit_codes.ERROR_SUB_PROCESS_FAILED.format(cls=self.inputs.sub_process_class)
 
-        for index, child in enumerate(self.ctx.children):
-            energy = child.outputs.total_energy
-            distance = self.ctx.distance_nodes[index]
-
+        for index, (outputs, distance, _) in enumerate(point_results(self.ctx.scan)):
+            energy = outputs['total_energy']
             self.report(f'Image {index}: distance={distance.value}, total energy={energy.value}')
             self.out(f'distances.{index}', distance)
             self.out(f'total_energies.{index}', energy)
-
-            if 'total_magnetization' in child.outputs:
-                self.out(f'total_magnetizations.{index}', child.outputs.total_magnetization)
+            if 'total_magnetization' in outputs:
+                self.out(f'total_magnetizations.{index}', outputs['total_magnetization'])
