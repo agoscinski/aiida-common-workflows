@@ -34,15 +34,10 @@ The QE point WorkChain still delegates to the existing QE relaxation.
 The existing EOS WorkChain delegates to the same prepared graph for standard QE calls and continues to publish the legacy indexed outputs.
 Other backends and other kinds of scans were not ported to the new launch API.
 
-## Graph-language problems
+## Graph-language blockers
 
-| Limitation | Impact and workaround |
-| --- | --- |
-| **Placements have a static process contract.** | The shared compatibility path still constructs a backend-specific builder for each point. Prepared QE EOS instead selects a concrete graph and validates its relaxation template before launch; no point resolves the backend or protocol. |
-| **Ports and spreads require statically known fields.** | The existing `sub_process` namespace accepts arbitrary backend overrides, including nested metadata and AiiDA data. The shared compatibility graph accepts a packed request; a calcfunction links the original input nodes. Prepared QE EOS applies and validates overrides before graph launch. |
-| **A graph call wires data, not the child WorkChain node.** | Quantum ESPRESSO now exposes `kpoints_used` on the common wrapper and wires that data directly. The shared mesh takes precedence over per-point mesh or density settings on follow-up runs. Other reference generators still inspect their reference WorkChain, so they stay on the compatibility path until they expose what they actually reuse. |
-| **`par_map` collects one leaf output per item in an owned container.** | A point has heterogeneous and optional fields. The adapter packs its fields into a homogeneous `DataDict` of singleton `DataList` values. The public WorkChain publishes standalone copies made by a calcfunction, because owned members cannot be returned directly. |
-| **`par_map(partial(...))` counts optional ports when checking for one unbound input.** | The independent scan maps a small nested graph that omits the optional reference mesh port. |
+None identified for the migrated scans.
+The remaining reference backends still need to expose the data their follow-up calculations reuse; that is plugin migration work, not a graph-language blocker.
 
 Scripts that look for direct relaxation children must traverse descendants instead.
 Existing in-flight WorkChains should be completed before upgrading because their outlines have changed.
