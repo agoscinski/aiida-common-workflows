@@ -216,9 +216,12 @@ class QuantumEspressoCommonRelaxInputGenerator(CommonRelaxInputGenerator):
             base_parameters_overrides['tot_magnetization'] = fixed_total_cell_magnetization
             final_scf_parameters_overrides['tot_magnetization'] = fixed_total_cell_magnetization
 
+        stages = ('base', 'base_final_scf') if 'base' in self.process_class.spec().inputs else (
+            'base_relax', 'base_init_relax'
+        )
         options_overrides = {
-            'base': {'pw': {'metadata': {'options': engines['relax']['options']}}},
-            'base_final_scf': {'pw': {'metadata': {'options': engines['relax']['options']}}},
+            name: {'pw': {'metadata': {'options': engines['relax']['options']}}}
+            for name in stages
         }
         overrides = recursive_merge(overrides, options_overrides)
 

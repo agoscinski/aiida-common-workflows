@@ -1,7 +1,9 @@
 """Tests for the :mod:`aiida_common_workflows.workflows.relax.quantum_espresso` module."""
+
 import pytest
 from aiida import engine, orm, plugins
 from aiida.common import LinkType
+from aiida.engine import WorkChain, calcfunction, run_get_node
 
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, RelaxType, SpinType
 
@@ -58,6 +60,121 @@ def test_reference_kpoints_are_used_by_all_active_qe_stages():
         assert builder[name].kpoints.pk == mesh.pk
         assert 'kpoints_distance' not in builder[name]
         assert 'kpoints_force_parity' not in builder[name]
+
+
+@pytest.mark.usefixtures('sssp')
+def test_prepare_eos_separates_execution_settings(default_builder_inputs):
+    from aiida_common_workflows.workflows.eos import prepare_eos
+
+    default_builder_inputs['engines']['relax']['options']['max_wallclock_seconds'] = 1234
+    workflow, prepared = prepare_eos(
+        backend='common_workflows.relax.quantum_espresso',
+        structure=default_builder_inputs['structure'],
+        protocol='fast',
+        scale_factors=[0.98, 1, 1.02],
+        generator_inputs={'engines': default_builder_inputs['engines'], 'relax_type': RelaxType.NONE},
+    )
+    assert workflow.build() is None
+    assert set(prepared.inputs) == {'structure', 'first', 'remaining', 'settings'}
+    config = prepared.execution_environment.runtime_config
+    assert config['reference'] == config['followup_relaxation']
+    stages = prepared.inputs['settings']['settings']
+    assert any(isinstance(stage, dict) and 'pw' in stage for stage in stages.values())
+    for name, stage in stages.items():
+        if isinstance(stage, dict) and 'pw' in stage:
+            assert 'code' not in stage['pw']
+            assert 'metadata' not in stage['pw']
+            assert config['reference'][name]['pw']['code'].uuid == default_builder_inputs['engines']['relax']['code']
+            options = config['reference'][name]['pw']['metadata']['options']
+            assert options['resources']['num_machines'] == 1
+            assert options['max_wallclock_seconds'] == 1234
+
+
+@calcfunction
+def _test_qe_results(structure):
+    mesh = orm.KpointsData()
+    mesh.set_kpoints_mesh([2, 3, 4])
+    return {'kpoints_used': mesh, 'total_energy': orm.Float(structure.get_cell_volume())}
+
+
+class _QeTestRelaxation(WorkChain):
+    """Replace the external QE calculation while exercising the real graph and point wrapper."""
+
+    @classmethod
+    def define(cls, spec):
+        super().define(spec)
+        spec.input('structure', valid_type=orm.StructureData)
+        spec.input('mesh', valid_type=orm.KpointsData, required=False)
+        spec.output('kpoints_used', valid_type=orm.KpointsData)
+        spec.output('total_energy', valid_type=orm.Float)
+        spec.outline(cls.results)
+
+    def results(self):
+        outputs = _test_qe_results(self.inputs.structure)
+        if 'mesh' in self.inputs:
+            outputs['kpoints_used'] = self.inputs.mesh
+        self.out_many(outputs)
+
+
+@pytest.mark.usefixtures('sssp')
+@pytest.mark.parametrize('legacy_entry_point', [False, True])
+def test_run_prepared_eos(default_builder_inputs, monkeypatch, legacy_entry_point):
+    from aiida_common_workflows.workflows.eos import EquationOfStateWorkChain, prepare_eos
+    from aiida_common_workflows.workflows.relax.quantum_espresso.eos import QuantumEspressoEosPoint
+
+    original_submit = QuantumEspressoEosPoint.submit
+    engines = default_builder_inputs['engines']
+
+    def submit_test_relaxation(self, builder):
+        values = {'structure': builder.structure}
+        stages = [name for name in ('base', 'base_final_scf', 'base_relax', 'base_init_relax') if builder.get(name)]
+        assert stages
+        for name in stages:
+            assert builder[name].pw.code.uuid == engines['relax']['code']
+            assert builder[name].pw.metadata.options.resources['num_machines'] == 1
+            if 'reference_mesh' in self.inputs:
+                assert builder[name].kpoints.pk == self.inputs.reference_mesh.pk
+                assert 'kpoints_distance' not in builder[name]
+                values['mesh'] = builder[name].kpoints
+        return original_submit(self, _QeTestRelaxation, **values)
+
+    monkeypatch.setattr(QuantumEspressoEosPoint, 'submit', submit_test_relaxation)
+    backend = 'common_workflows.relax.quantum_espresso'
+    structure = default_builder_inputs['structure']
+    factors = [0.98, 1.02, 1.0]
+    generator_inputs = {'engines': engines, 'relax_type': 'none'}
+    if legacy_entry_point:
+        outputs, node = run_get_node(
+            EquationOfStateWorkChain,
+            structure=structure,
+            sub_process_class=backend,
+            scale_factors=factors,
+            generator_inputs={'protocol': 'fast', **generator_inputs},
+        )
+        graph_node = next(child for child in node.called if isinstance(child, orm.GraphNode))
+        energies = [item.value for item in outputs['total_energies'].values()]
+    else:
+        workflow, prepared = prepare_eos(
+            backend=backend,
+            structure=structure,
+            scale_factors=factors,
+            protocol='fast',
+            generator_inputs=generator_inputs,
+        )
+        outputs, graph_node = run_get_node(workflow, prepared_run=prepared)
+        node = graph_node
+        energies = [point['total_energy'][0].value for point in [outputs['first'], *outputs['remaining']]]
+
+    assert node.is_finished_ok
+    assert graph_node.is_finished_ok
+    assert graph_node.base.attributes.get(graph_node.PROTOCOL_KEY)['protocol'].endswith('.fast')
+    assert energies == pytest.approx(factors)
+    points = [child for child in graph_node.called if child.process_label == QuantumEspressoEosPoint.__name__]
+    (reference,) = [child for child in points if 'reference_mesh' not in child.inputs]
+    assert len(points) == 3
+    assert all(
+        child.inputs.reference_mesh.pk == reference.outputs.kpoints_used.pk for child in points if child != reference
+    )
 
 
 @pytest.mark.usefixtures('sssp')

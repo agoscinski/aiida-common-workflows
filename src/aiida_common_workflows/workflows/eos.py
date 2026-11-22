@@ -1,9 +1,11 @@
 """Equation of state workflow that can use any code plugin implementing the common relax workflow."""
 import inspect
+from collections.abc import Mapping, Sequence
+from importlib import import_module
 
 from aiida import orm
 from aiida.common import exceptions
-from aiida.engine import WorkChain
+from aiida.engine import GraphHandle, PreparedRun, ToContext, WorkChain
 from aiida.plugins import WorkflowFactory
 
 from aiida_common_workflows.workflows.relax.generator import ElectronicType, RelaxType, SpinType
@@ -66,6 +68,43 @@ def validate_relax_type(value, _):
     if value not in [RelaxType.NONE, RelaxType.POSITIONS, RelaxType.SHAPE, RelaxType.POSITIONS_SHAPE]:
         return '`generator_inputs.relax_type`. Equation of state and relaxation with variable volume not compatible.'
 
+
+_QE_BACKEND = 'common_workflows.relax.quantum_espresso'
+
+
+def prepare_eos(  # noqa: PLR0913
+    *,
+    backend: str,
+    structure: orm.StructureData,
+    scale_factors: Sequence[float],
+    protocol: str,
+    generator_inputs: Mapping,
+    overrides: Mapping | None = None,
+) -> tuple[GraphHandle, PreparedRun]:
+    """Select an EOS graph and resolve its inputs before launch.
+
+    ``backend`` is a common relaxation entry point name. Only Quantum ESPRESSO
+    currently provides a prepared EOS graph; other backends use the legacy API.
+
+    :param backend: Common relaxation entry point.
+    :param structure: Unscaled reference structure.
+    :param scale_factors: Ordered volume factors; the first selects the reference.
+    :param protocol: Backend protocol name.
+    :param generator_inputs: Inputs to the backend protocol resolver, such as engines and relaxation type.
+    :param overrides: Optional concrete relaxation port overrides.
+    :return: Concrete graph and its prepared launch settings.
+    :raises ValueError: If the backend or EOS inputs are unsupported.
+    """
+    if backend != _QE_BACKEND:
+        msg = f'No prepared EOS graph is available for {backend!r}.'
+        raise ValueError(msg)
+    if error := validate_relax_type(generator_inputs.get('relax_type'), None):
+        raise ValueError(error)
+    module = import_module('aiida_common_workflows.workflows.relax.quantum_espresso.eos')
+    return module.qe_eos, module.prepare(
+        structure=structure, scale_factors=scale_factors, protocol=protocol,
+        generator_inputs=generator_inputs, overrides=overrides,
+    )
 
 
 class EquationOfStateWorkChain(WorkChain):
@@ -131,7 +170,19 @@ class EquationOfStateWorkChain(WorkChain):
         return tuple(float(1 + i * increment - (count - 1) * increment / 2) for i in range(count))
 
     def run_scan(self):
-        """Submit the reference-first volume scan."""
+        """Submit the prepared QE EOS graph or fall back to legacy backends."""
+        if self.inputs.sub_process_class == _QE_BACKEND and 'structure' not in self.inputs.get('sub_process', {}):
+            generator_inputs = dict(self.inputs.generator_inputs)
+            protocol = generator_inputs.pop('protocol')
+            workflow, prepared = prepare_eos(
+                backend=_QE_BACKEND,
+                structure=self.inputs.structure,
+                scale_factors=self.get_scale_factors(),
+                protocol=protocol,
+                generator_inputs=generator_inputs,
+                overrides=self.inputs.get('sub_process'),
+            )
+            return ToContext(scan=self.submit(workflow, prepared_run=prepared))
         return submit_scan(
             self, structure=self.inputs.structure, coordinates=self.get_scale_factors(), mode='volume', reference=True
         )
